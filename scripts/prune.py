@@ -30,9 +30,10 @@ def load_gemma_model(model_id="google/gemma-4-E4B-it"):
 # ==========================================
 # ÉTAPE 2 : Capture des activations
 # ==========================================
-def capture_activations(model, tokenizer, dataset_path, num_samples=200):
+def capture_activations(model, tokenizer, dataset_path, num_samples=200, max_tokens=2000):
     """
     Fait passer un échantillon de données dans le modèle et capture les activations FFN.
+    Intègre un sous-échantillonnage pour éviter la saturation mémoire en O(N^2).
     """
     print(f"Chargement du dataset depuis {dataset_path}...")
     # On charge le dataset unifié mentionné dans votre README
@@ -65,7 +66,6 @@ def capture_activations(model, tokenizer, dataset_path, num_samples=200):
     with torch.no_grad(): # Indispensable pour ne pas stocker les gradients (économise la VRAM)
         for item in tqdm(sample_data):
             # Adaptation basique du texte (à ajuster selon la structure exacte de votre UnifiedSample)
-            # Si c'est du multimodal, il faudra passer l'image au processor ici
             text = item.get("text_prompt", item.get("question", "")) # pyright: ignore
             inputs = tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
             inputs = {k: v.to(model.device) for k, v in inputs.items()}
@@ -77,9 +77,17 @@ def capture_activations(model, tokenizer, dataset_path, num_samples=200):
     for handle in handles:
         handle.remove()
 
-    # Concaténation des activations par couche pour faciliter le calcul de l'Information Mutuelle
+    print(f"Sous-échantillonnage des activations à {max_tokens} tokens maximum par couche...")
+    # Concaténation et sous-échantillonnage des activations par couche
     for i in activations.keys():
-        activations[i] = torch.cat(activations[i], dim=0) # pyright: ignore
+        acts = torch.cat(activations[i], dim=0) # pyright: ignore
+        
+        # Sélection aléatoire si le nombre de tokens dépasse la limite fixée
+        if acts.shape[0] > max_tokens:
+            indices = torch.randperm(acts.shape[0])[:max_tokens]
+            acts = acts[indices]
+            
+        activations[i] = acts # type: ignore
         
     print("Capture terminée ! Les activations sont prêtes pour l'analyse.")
     return activations
@@ -127,31 +135,70 @@ def compute_renyi_entropy(K, alpha=1.01):
     entropy = (1 / (1 - alpha)) * torch.log2(torch.sum(eigvals ** alpha))
     return entropy
 
-def calculate_mi_between_neurons(z_k, z_l, sigma, alpha=1.01):
+def optimize_kernel_width(z, sigma_l, max_iter=20, lr=0.1):
     """
-    Calcule l'Information Mutuelle I(Z_k ; Z_l) entre deux neurones.
+    Optimise le paramètre sigma d'un neurone en maximisant le Kernel Alignment Loss
+    par rapport au noyau global de la couche (sigma_l).
     """
-    # Matrices de noyaux individuelles
-    K_k = compute_kernel_matrix(z_k, sigma)
-    K_l = compute_kernel_matrix(z_l, sigma)
+    # z: tenseur 1D (N_samples)
+    device = z.device
     
-    # Entropies individuelles
+    # On initialise le sigma du neurone avec la valeur de Scott globale
+    sigma_n = torch.tensor([sigma_l], requires_grad=True, device=device)
+    optimizer = torch.optim.Adam([sigma_n], lr=lr)
+    
+    # Noyau de référence (constant)
+    K_l = compute_kernel_matrix(z, sigma_l).detach()
+    norm_K_l = torch.norm(K_l, p='fro')
+    
+    for _ in range(max_iter):
+        optimizer.zero_grad()
+        K_n = compute_kernel_matrix(z, sigma_n)
+        
+        # Kernel Alignment = <K_l, K_n>_F / (||K_l||_F * ||K_n||_F)
+        inner_product = torch.sum(K_l * K_n)
+        norm_K_n = torch.norm(K_n, p='fro')
+        
+        alignment = inner_product / (norm_K_l * norm_K_n + 1e-8)
+        
+        # Maximiser l'alignement équivaut à minimiser son opposé
+        loss = -alignment
+        loss.backward()
+        optimizer.step()
+        
+        # S'assurer que sigma_n reste strictement positif
+        with torch.no_grad():
+            sigma_n.clamp_(min=1e-3)
+            
+    return sigma_n.item()
+
+def calculate_mi_between_neurons(z_k, z_l, sigma_l, alpha=1.01):
+    """
+    Calcule l'Information Mutuelle I(Z_k ; Z_l) entre deux neurones avec optimisation de sigma.
+    """
+    # 1. Optimisation des largeurs de noyau individuelles
+    sigma_k = optimize_kernel_width(z_k, sigma_l)
+    sigma_l_opt = optimize_kernel_width(z_l, sigma_l)
+    
+    # 2. Matrices de noyaux individuelles optimisées
+    K_k = compute_kernel_matrix(z_k, sigma_k)
+    K_l = compute_kernel_matrix(z_l, sigma_l_opt)
+    
+    # 3. Entropies individuelles
     S_k = compute_renyi_entropy(K_k, alpha)
     S_l = compute_renyi_entropy(K_l, alpha)
     
-    # Matrice de noyau jointe (Produit de Hadamard / élément par élément)
+    # 4. Matrice de noyau jointe
     K_joint = K_k * K_l
     S_joint = compute_renyi_entropy(K_joint, alpha)
     
     # Information Mutuelle
     MI = S_k + S_l - S_joint
-    return max(0.0, MI.item()) # Le MI ne peut pas être négatif théoriquement
+    return max(0.0, MI.item())
 
-def compute_mutual_information(activations, alpha=1.01, gamma=1.0, compression_rate=0.1):
+def compute_mutual_information(activations, alpha=1.01, gamma=1.0, compression_rate=0.1, block_size=2048):
     """
-    Identifie les neurones redondants en utilisant le clustering basé sur l'Information Mutuelle
-    tel que décrit dans la Section 3.3.3 du papier.
-    compression_rate: pourcentage de neurones à élaguer (ex: 0.1 pour 10%)
+    Identifie les neurones redondants par blocs pour traiter toute la couche.
     """
     print("\n--- Début de l'analyse de l'Information Mutuelle et Clustering ---")
     redundant_pairs_by_layer = {}
@@ -162,71 +209,70 @@ def compute_mutual_information(activations, alpha=1.01, gamma=1.0, compression_r
         N = acts.shape[0]
         d = acts.shape[1] 
         
-        # Règle de Scott pour le paramètre du noyau
-        sigma = gamma * math.pow(N, -1 / (4 + d))
-        
-        # Pour éviter un calcul O(d^2) massif, on analyse un sous-ensemble représentatif
-        # ou on effectue le calcul par blocs si la VRAM le permet.
-        # Ici on prend un échantillon de neurones pour l'exemple (à ajuster selon ta RAM)
-        subset_size = min(d, 2000) 
-        subset_indices = torch.randperm(d)[:subset_size]
-        acts_subset = acts[:, subset_indices]
-        
-        print(f"  -> Calcul de la matrice de distance MI sur un sous-ensemble de {subset_size} neurones...")
-        
-        # Matrice de distance basée sur MI: d(Z_k, Z_l) = exp(-I(Z_k, Z_l))
-        # Initialisée à 0
-        distance_matrix = np.zeros((subset_size, subset_size))
-        
-        for i in range(subset_size):
-            for j in range(i + 1, subset_size):
-                z_k = acts_subset[:, i]
-                z_l = acts_subset[:, j]
-                mi_score = calculate_mi_between_neurons(z_k, z_l, sigma, alpha)
-                
-                # Équation (1) du papier: A * exp(-I)
-                dist = np.exp(-mi_score) 
-                distance_matrix[i, j] = dist
-                distance_matrix[j, i] = dist
-                
-        # Multidimensional Scaling (MDS) pour projeter dans un espace de dimension inférieure
-        print("  -> Projection MDS...")
-        mds = MDS(n_components=10, dissimilarity='precomputed', random_state=42, normalized_stress='auto')
-        mds_coords = mds.fit_transform(distance_matrix)
-        
-        # Clustering: On regroupe les neurones similaires.
-        # Le nombre de clusters correspond au nombre de neurones qu'on veut GARDER dans ce sous-ensemble.
-        num_clusters = int(subset_size * (1 - compression_rate))
-        print(f"  -> Clustering (KMeans) pour trouver les représentants de {num_clusters} clusters...")
-        
-        kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init="auto")
-        labels = kmeans.fit_predict(mds_coords)
+        # Règle de Scott globale pour la couche (sigma_l)
+        sigma_l = gamma * math.pow(N, -1 / (4 + d))
         
         layer_redundant_pairs = []
         
-        # On garde le neurone le plus proche du centroïde, on prune les autres
-        for cluster_id in range(num_clusters):
-            cluster_indices = np.where(labels == cluster_id)[0]
-            if len(cluster_indices) > 1:
-                # Calculer la distance au centroïde
-                centroid = kmeans.cluster_centers_[cluster_id]
-                distances_to_centroid = np.linalg.norm(mds_coords[cluster_indices] - centroid, axis=1)
-                
-                # Le représentant est celui avec la distance minimale
-                representative_idx = cluster_indices[np.argmin(distances_to_centroid)]
-                
-                # Tous les autres dans le cluster sont considérés comme redondants
-                for idx in cluster_indices:
-                    if idx != representative_idx:
-                        # On mappe les indices locaux du sous-ensemble vers les indices globaux de la couche
-                        global_rep = subset_indices[representative_idx].item()
-                        global_redundant = subset_indices[idx].item()
-                        
-                        # Format attendu par la fonction de pruning: (gardé, supprimé, score_virtuel)
-                        layer_redundant_pairs.append((global_rep, global_redundant, 1.0))
+        # Découpage de la couche en blocs pour traiter TOUS les neurones sans O(d^2) massif
+        num_blocks = math.ceil(d / block_size)
         
+        for block_idx in range(num_blocks):
+            start_idx = block_idx * block_size
+            end_idx = min(start_idx + block_size, d)
+            current_block_size = end_idx - start_idx
+            
+            print(f"  -> Traitement du bloc {block_idx+1}/{num_blocks} ({current_block_size} neurones)...")
+            acts_block = acts[:, start_idx:end_idx]
+            
+            distance_matrix = np.zeros((current_block_size, current_block_size))
+            
+            # Calcul de la matrice de distance MI pour ce bloc
+            for i in range(current_block_size):
+                for j in range(i + 1, current_block_size):
+                    z_k = acts_block[:, i]
+                    z_l = acts_block[:, j]
+                    mi_score = calculate_mi_between_neurons(z_k, z_l, sigma_l, alpha)
+                    
+                    dist = np.exp(-mi_score) 
+                    distance_matrix[i, j] = dist
+                    distance_matrix[j, i] = dist
+
+            # Num_clusters correspond au nombre de neurones à GARDER dans ce bloc
+            num_clusters = int(current_block_size * (1 - compression_rate))
+            
+            # Gérer le cas où le bloc est trop petit
+            if num_clusters < 1 or num_clusters >= current_block_size:
+                continue
+
+            # MDS Projection
+            # NOTE : Le papier recommande de tester M graines aléatoires et de garder celle
+            # minimisant la divergence KL. Pour des raisons de performance d'exécution,
+            # nous fixons ici une graine par défaut, mais ce paramètre peut être itéré.
+            mds = MDS(n_components=10, dissimilarity='precomputed', random_state=42, normalized_stress='auto')
+            mds_coords = mds.fit_transform(distance_matrix)
+            
+            # Clustering
+            kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init="auto")
+            labels = kmeans.fit_predict(mds_coords)
+            
+            # Extraction des représentants
+            for cluster_id in range(num_clusters):
+                cluster_indices = np.where(labels == cluster_id)[0]
+                if len(cluster_indices) > 1:
+                    centroid = kmeans.cluster_centers_[cluster_id]
+                    distances_to_centroid = np.linalg.norm(mds_coords[cluster_indices] - centroid, axis=1)
+                    
+                    representative_local_idx = cluster_indices[np.argmin(distances_to_centroid)]
+                    
+                    for local_idx in cluster_indices:
+                        if local_idx != representative_local_idx:
+                            global_rep = start_idx + representative_local_idx
+                            global_redundant = start_idx + local_idx
+                            layer_redundant_pairs.append((global_rep, global_redundant, 1.0))
+                            
         redundant_pairs_by_layer[layer_idx] = layer_redundant_pairs
-        print(f"  -> {len(layer_redundant_pairs)} neurones marqués pour suppression sur cette couche.")
+        print(f"  -> Total : {len(layer_redundant_pairs)} neurones marqués pour suppression sur cette couche.")
         
     return redundant_pairs_by_layer
 

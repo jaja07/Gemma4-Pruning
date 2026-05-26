@@ -1,124 +1,83 @@
-# Gemma-Pruning-MI : Élagage Structurel Non Supervisé des LLM basé sur l'Information Mutuelle
+# Gemma-Pruning
 
-Ce projet fournit une implémentation complète et optimisée de la méthode d'élagage (*pruning*) présentée dans le papier de recherche **Large Language Model Pruning** (Huang et al., 2024). Cette approche permet de compresser les grands modèles de langage, spécifiquement calibrée ici pour l'architecture **Gemma 4 (google/gemma-4-E4B-it)**, de manière **totalement non supervisée** et **sans nécessiter de réentraînement**.
+Projet de pruning non supervisé pour Gemma, centré sur la compression des couches FFN à partir d'un échantillon de données local. Le dépôt contient deux briques principales : le téléchargement du dataset Hugging Face au format local et le script de pruning qui capture les activations, estime l'information mutuelle entre neurones, puis supprime les neurones redondants avant de sauvegarder un modèle élagué.
 
-L'objectif principal est d'éliminer la redondance au sein des couches de réseaux de neurones d'extension (Feed-Forward Networks, FFN) en utilisant l'estimateur d'entropie de Rényi d'ordre $\alpha$ appliqué à des matrices de noyau, combiné à une stratégie de clustering par réduction de dimensionnalité (MDS + K-Means).
+## Contenu du projet
 
----
+- [main.py](main.py) : point d'entrée minimal du dépôt.
+- [scripts/download_dataset.py](scripts/download_dataset.py) : télécharge le dataset `ECE-ILAB/resilient-ai-unified` depuis Hugging Face et le sauvegarde localement avec `datasets.save_to_disk`.
+- [scripts/prune.py](scripts/prune.py) : charge `google/gemma-4-E4B-it`, capture les activations des couches MLP via hooks, calcule une matrice de distances basée sur l'information mutuelle, applique MDS puis KMeans, et reconstruit les couches linéaires après suppression des neurones redondants.
+- [data/](data/) : emplacement attendu pour le dataset local.
+- [model/](model/) : dossier de sortie pour les modèles exportés.
 
-## 1. Architecture du Pipeline
+## Pipeline
 
-Le processus de compression est découpé en quatre étapes majeures, orchestrées de manière séquentielle pour minimiser l'empreinte VRAM et maximiser la précision de l'identification des neurones redondants :
+1. Télécharger le dataset localement avec `scripts/download_dataset.py`.
+2. Lancer le pruning avec `scripts/prune.py`.
+3. Le script charge le tokenizer et le modèle en `bfloat16`, enregistre les activations des hooks sur `down_proj`, sous-échantillonne les tokens pour limiter la mémoire, calcule l'information mutuelle par blocs, puis identifie les neurones à conserver dans chaque cluster.
+4. Le modèle élagué est ensuite sauvegardé avec sa configuration Hugging Face mise à jour, y compris `model.config.intermediate_size`.
 
-```text
-[ Étape 1 : Chargement ]  ──> Charge le modèle Gemma en bfloat16 et son tokenizer
-           │
-           ▼
-[ Étape 2 : Capture ]     ──> Enregistre les activations FFN via hooks (aplatissement token-level)
-           │
-           ▼
-[ Étape 3 : Analyse ]     ──> Calcule l'Information Mutuelle, applique MDS et segmente via KMeans
-           │
-           ▼
-[ Étape 4 : Découpe ]     ──> Suppression physique des poids, ajustement de la config et sauvegarde
-```
+## Fondations mathématiques
 
-1. **Chargement et initialisation** : le modèle cible est instancié en précision `bfloat16` avec une distribution automatique sur les ressources matérielles disponibles via `device_map="auto"`.
-2. **Capture des activations** : des *PyTorch Forward Hooks* sont greffés sur la sous-couche `down_proj` de chaque bloc FFN. Un échantillon de texte passe dans le modèle. Pour éviter toute distorsion liée au padding et capturer la sémantique fine, les tenseurs 3D `(batch, seq_len, dim)` sont immédiatement projetés et aplatis en matrices 2D `(N_tokens, D_neurons)`. Chaque token est traité comme un échantillon statistique indépendant.
-3. **Analyse informationnelle et clustering** : au lieu d'une analyse combinatoire exhaustive en $O(d^2)$ impraticable sur les grands modèles, le script extrait un sous-ensemble représentatif de neurones cachés, évalue leurs profils d'Information Mutuelle, convertit ces scores en distances géométriques, projette l'espace via MDS (*Multidimensional Scaling*) et regroupe les neurones similaires via KMeans.
-4. **Découpe physique et sauvegarde** : pour chaque cluster, seul le neurone le plus proche du centroïde est conservé. Les autres sont physiquement supprimés en modifiant les dimensions des matrices de poids des opérateurs linéaires (`gate_proj`, `up_proj`, `down_proj`). La configuration Hugging Face (`model.config.intermediate_size`) est mise à jour pour garantir la parfaite rechargeabilité du modèle.
+L'algorithme du projet repose sur une estimation non supervisée de la redondance entre neurones FFN à partir d'une information mutuelle définie dans un espace de Hilbert à noyau reproduisant (RKHS).
 
----
+### Entropie de Rényi d'ordre $\alpha$
 
-## 2. Description de l'Algorithme Implémenté
-
-### Fondations Mathématiques
-
-L'algorithme repose sur la théorie de l'information appliquée aux espaces de Hilbert à noyau reproduisant (RKHS), permettant d'estimer l'Information Mutuelle sans avoir à modéliser explicitement des distributions de probabilité de haute dimension.
-
-#### 1. Entropie de Rényi d'ordre $\alpha$ matricielle
-
-Pour une variable aléatoire $Z_k$ correspondant aux activations d'un neurone $k$ sur $N$ échantillons, on calcule une matrice de Gram $K_k \in \mathbb{R}^{N \times N}$ via un noyau gaussien RBF (*Radial Basis Function*) :
+Pour un neurone $Z_k$ observé sur $N$ échantillons, on construit une matrice de Gram $K_k$ avec un noyau gaussien RBF :
 
 $$K_k(i, j) = \exp\left(-\frac{(z_{k,i} - z_{k,j})^2}{2\sigma^2}\right)$$
 
-La matrice est normalisée par sa trace pour que $\tilde{K}_k = \frac{K_k}{\text{tr}(K_k)}$. L'entropie matricielle de Rényi d'ordre $\alpha$ est définie par le spectre de valeurs propres $\{\lambda_1, \dots, \lambda_N\}$ de $\tilde{K}_k$ :
+Après normalisation par la trace, la matrice $\tilde{K}_k = \frac{K_k}{\mathrm{tr}(K_k)}$ permet de calculer l'entropie de Rényi :
 
 $$S_\alpha(\tilde{K}_k) = \frac{1}{1-\alpha} \log_2\left(\sum_{i=1}^{N} \lambda_i^\alpha\right)$$
 
-#### 2. Information Mutuelle entre deux neurones
+où $\{\lambda_1, \dots, \lambda_N\}$ sont les valeurs propres de $\tilde{K}_k$.
 
-L'entropie jointe de deux neurones $k$ et $l$ est estimée à l'aide du produit de Hadamard de leurs matrices de noyau respectives : $K_{\text{joint}} = K_k \odot K_l$. L'Information Mutuelle est alors :
+### Information mutuelle entre deux neurones
+
+L'entropie jointe de deux neurones $k$ et $l$ est estimée à l'aide du produit de Hadamard de leurs matrices de noyau : $K_{\text{joint}} = K_k \odot K_l$. L'information mutuelle est alors :
 
 $$I(Z_k ; Z_l) = S_\alpha(\tilde{K}_k) + S_\alpha(\tilde{K}_l) - S_\alpha(\tilde{K}_{\text{joint}})$$
 
-#### 3. Règle de Scott empirique pour la largeur de noyau
+### Largeur de noyau et clustering
 
-Le paramètre de bande passante $\sigma$ est déterminant. Conformément à la section 3.4 du papier, il est calculé au niveau de la couche globale en fonction du nombre d'échantillons $N$ et de la dimensionnalité $d$ des neurones cachés :
+La largeur de noyau $\sigma$ suit une règle de Scott empirique dépendant du nombre d'échantillons $N$ et de la dimension $d$ :
 
 $$\sigma = \gamma N^{-\frac{1}{4+d}}$$
 
-### Stratégie de mise à l'échelle : clustering géométrique
+Les scores d'information mutuelle sont ensuite transformés en distances, projetés avec MDS, puis regroupés avec KMeans. Dans chaque cluster, seul le neurone le plus proche du centroïde est conservé, les autres étant supprimés physiquement des matrices `gate_proj`, `up_proj` et `down_proj`.
 
-Pour contourner la complexité quadratique liée à la comparaison de toutes les paires de neurones, le pipeline applique la méthodologie de la section 3.3.3 :
+## Installation
 
-1. Les scores d'Information Mutuelle sont convertis en métrique de dissimilarité : $d(\mathcal{Z}_k, \mathcal{Z}_l) = \exp(-I(Z_k; Z_l))$.
-2. L'algorithme **MDS** projette cette matrice de distance dans un espace euclidien restreint, par exemple 10 dimensions.
-3. L'algorithme **K-Means** segmente cet espace. Le nombre de clusters cibles est directement dicté par le taux de compression souhaité.
-4. Au sein de chaque groupe, le neurone le plus proche du centroïde géométrique est désigné comme le représentant sémantique. Tous les autres neurones du même groupe sont marqués pour l'élagage.
-
----
-
-## 3. Installation et Configuration de l'Environnement avec `uv`
-
-Ce projet utilise `uv`, un gestionnaire de paquets et d'environnements Python extrêmement rapide écrit en Rust.
-
-### Configuration pour Windows avec support natif CUDA
-
-Sous Windows, pour s'assurer que les dépendances PyTorch précompilées intègrent correctement le support matériel GPU de votre carte NVIDIA, il convient de cibler explicitement l'index binaire approprié, avec CUDA 12.4 de préférence pour une compatibilité maximale.
-
-Exécutez la suite de commandes suivante dans votre terminal PowerShell :
+L'installation se fait avec `uv` et l'environnement se prépare simplement avec :
 
 ```powershell
-# 1. Initialiser le projet et créer la structure de base
-uv init gemma-pruning-mi
-cd gemma-pruning-mi
-
-# 2. Configurer explicitement l'index PyTorch pour récupérer les versions Windows compatibles CUDA 12.4
-uv add torch --index https://download.pytorch.org/whl/cu124
-
-# 3. Ajouter l'écosystème Hugging Face et les outils de Data Science requis
-uv add transformers datasets accelerate tqdm scikit-learn numpy
+uv sync
 ```
 
-### Vérification de la disponibilité de CUDA
+L'index PyTorch CUDA 12.4 est déjà déclaré dans [pyproject.toml](pyproject.toml), donc aucune commande d'installation supplémentaire n'est nécessaire.
 
-Pour confirmer que l'environnement virtuel créé par `uv` accède de manière transparente à votre GPU NVIDIA local, lancez la commande de diagnostic suivante :
+## Utilisation
+
+Pour récupérer le dataset puis lancer le pruning :
 
 ```powershell
-uv run python -c "import torch; print(f'CUDA disponible : {torch.cuda.is_available()}'); print(f'GPU détecté : {torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"Aucun\"}')"
+uv run python scripts/download_dataset.py
+uv run python scripts/prune.py
 ```
 
----
-
-## 4. Guide d'Utilisation
-
-### Configuration des Chemins
-
-Ouvrez le fichier `script.py` et modifiez les constantes au sein du bloc principal `if __name__ == "__main__":` pour refléter vos répertoires locaux :
+Le script de pruning utilise par défaut :
 
 ```python
-MODEL_ID = "google/gemma-4-E4B-it"             # Identifiant Hugging Face ou chemin local du modèle
-DATASET_PATH = "C:/chemin/vers/votre/dataset"  # Chemin vers le dossier du dataset au format Arrow/Hugging Face
-SAVE_PATH = "./models/gemma4-pruned-mi"        # Répertoire de destination du modèle compressé
+MODEL_ID = "google/gemma-4-E4B-it"
+DATASET_PATH = os.path.join(BASE_DIR, "data", "unified")
+SAVE_PATH = os.path.join(BASE_DIR, "models", "gemma4-pruned-mi")
 ```
 
-### Exécution du Pipeline
+Adapte ces chemins si ton environnement local diffère de la structure du dépôt.
 
-Pour lancer le script complet au sein de l'environnement isolé géré par `uv`, exécutez simplement :
+## Remarques
 
-```powershell
-uv run script.py
-```
-
-Le script affichera la progression pas à pas dans la console, détaillera le volume de neurones supprimés par couche FFN, mettra à jour les configurations sous-jacentes et exportera le modèle prêt à être évalué sur vos bancs de test.
+- Le script est pensé pour des exécutions gourmandes en VRAM et bénéficie de `device_map="auto"`.
+- La partie analytique repose sur `torch`, `transformers`, `datasets`, `scikit-learn`, `numpy` et `tqdm`.
+- Le point d'entrée `main.py` est volontairement minimal et peut servir de base pour des tests ou une orchestration future.

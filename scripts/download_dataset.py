@@ -23,7 +23,7 @@ def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     
     # 2. Sauvegarde au format Arrow (le format optimisé attendu par load_from_disk)
-    ds.save_to_disk(DATA_DIR)
+    ds.save_to_disk(DATA_DIR) # type: ignore
     
     print("\nSauvegarde terminée ! Tu peux maintenant lancer ton script de pruning.")
 
