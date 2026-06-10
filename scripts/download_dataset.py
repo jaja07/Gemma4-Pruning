@@ -1,31 +1,59 @@
 import os
-from datasets import load_dataset
+from datasets import load_dataset, Dataset
 
-def main():
-    # Le chemin local où ton script de pruning attend les données
-    # Ajuste-le si tu es sur Windows et non dans un conteneur WSL
-    # ex: DATA_DIR = "C:/Projets/data/unified"
-    DATA_DIR = "/workspace/code/data/unified" 
-    DATASET_ID = "ECE-ILAB/resilient-ai-unified"
+# def download_calibration_data(dataset_id: str, save_dir: str, token: str = None): #pyright: ignore
+#     """
+#     Télécharge uniquement le split 'calibration' d'un dataset Hugging Face
+#     et le sauvegarde localement au format Arrow.
+#     """
+#     print(f"Téléchargement du split 'calibration' de '{dataset_id}' depuis Hugging Face...")
+    
+#     # 1. Téléchargement uniquement du split "calibration" (en utilisant les arguments de la fonction)
+#     ds_calib = load_dataset(
+#         dataset_id, 
+#         split="calibration", 
+#         trust_remote_code=True, 
+#         token=token
+#     )
+    
+#     print("\nDataset de calibration téléchargé avec succès. Aperçu :")
+#     print(ds_calib)
+    
+#     # 2. Création du dossier cible basé sur l'argument 'save_dir'
+#     print(f"\nSauvegarde locale dans {save_dir}...")
+#     os.makedirs(save_dir, exist_ok=True)
+    
+#     # 3. Sauvegarde au format Arrow
+#     ds_calib.save_to_disk(save_dir) # pyright: ignore
+    
+#     print("\nSauvegarde terminée ! Les données de calibration sont prêtes.")
 
-    print(f"Téléchargement du dataset {DATASET_ID} depuis Hugging Face...")
-    print("Cela peut prendre du temps (env. 57 Go au total)...")
+def download_calibration_data(dataset_id: str, save_dir: str, token: str = None): # pyright: ignore
+    """
+    Extrait à la volée 200 échantillons de calibration sans télécharger 
+    les dizaines de gigaoctets du dataset complet grâce au streaming.
+    """
+    print(f"Connexion au dataset '{dataset_id}' en mode STREAMING...")
     
-    # 1. Téléchargement. 
-    # Mettre trust_remote_code=True est parfois nécessaire pour les datasets persos
-    ds = load_dataset(DATASET_ID, trust_remote_code=True)
+    # 1. Chargement en flux (streaming=True : téléchargement instantané de 0 Go)
+    ds_stream = load_dataset(
+        dataset_id, 
+        split="calibration", 
+        streaming=True, 
+        trust_remote_code=True, 
+        token=token
+    )
     
-    print("\nDataset téléchargé avec succès. Aperçu des splits :")
-    print(ds)
+    # 2. Extraction stricte des 200 échantillons requis depuis le flux internet
+    print("Extraction rapide des 200 premiers échantillons de calibration...")
+    samples = list(ds_stream.take(200)) # pyright: ignore
     
-    print(f"\nSauvegarde locale dans {DATA_DIR}...")
-    # Crée le dossier s'il n'existe pas
-    os.makedirs(DATA_DIR, exist_ok=True)
+    # 3. Conversion instantanée en un Dataset Arrow local
+    ds_local = Dataset.from_list(samples) # pyright: ignore
     
-    # 2. Sauvegarde au format Arrow (le format optimisé attendu par load_from_disk)
-    ds.save_to_disk(DATA_DIR) # type: ignore
+    # 4. Sauvegarde locale de ce mini-dataset (quelques Mo à peine)
+    print(f"Sauvegarde locale de l'échantillon extrait dans {save_dir}...")
+    os.makedirs(save_dir, exist_ok=True)
+    ds_local.save_to_disk(save_dir)
     
-    print("\nSauvegarde terminée ! Tu peux maintenant lancer ton script de pruning.")
-
-if __name__ == "__main__":
-    main()
+    print("\n[Succès] Vos 200 exemples de calibration sont prêts localement en quelques secondes !")

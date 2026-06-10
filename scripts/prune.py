@@ -9,12 +9,28 @@ import numpy as np
 from sklearn.manifold import MDS
 from sklearn.cluster import KMeans
 
+from scripts.math_utils import calculate_mi_between_neurons
+
+def get_mlp_modules(model):
+    """
+    Parcourt dynamiquement l'ensemble du modèle et extrait tous les blocs MLP,
+    quelle que soit l'architecture (VLM, CausalLM, ConditionalGeneration).
+    """
+    mlps = []
+    for name, module in model.named_modules():
+        # On identifie un bloc MLP valide s'il possède les projections attendues
+        if name.endswith("mlp") and hasattr(module, "down_proj") and hasattr(module, "gate_proj"):
+            mlps.append(module)
+            
+    if not mlps:
+        raise ValueError("Aucun bloc MLP trouvé dans l'architecture du modèle !")
+        
+    return mlps
+
 # ==========================================
-# ÉTAPE 1 : Chargement
-# ==========================================
-def load_gemma_model(model_id="google/gemma-4-E4B-it"):
+def load_gemma_model(model_id="google/gemma-4-E4B-it", token : str = None): #pyright: ignore
     print(f"Chargement du tokenizer pour {model_id}...")
-    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    tokenizer = AutoTokenizer.from_pretrained(model_id, token=token)
 
     print(f"Chargement du modèle {model_id} en bfloat16...")
     # L'utilisation de device_map="auto" permet de répartir le modèle 
@@ -28,37 +44,32 @@ def load_gemma_model(model_id="google/gemma-4-E4B-it"):
     return model, tokenizer
 
 # ==========================================
-# ÉTAPE 2 : Capture des activations
-# ==========================================
 def capture_activations(model, tokenizer, dataset_path, num_samples=200, max_tokens=2000):
     """
     Fait passer un échantillon de données dans le modèle et capture les activations FFN.
     Intègre un sous-échantillonnage pour éviter la saturation mémoire en O(N^2).
     """
     print(f"Chargement du dataset depuis {dataset_path}...")
-    # On charge le dataset unifié mentionné dans votre README
     dataset = load_from_disk(dataset_path)
+    sample_data = dataset.shuffle(seed=42).select(range(num_samples)) # pyright: ignore
     
-    # On prend un petit échantillon déterministe (pour la reproductibilité seed=42)
-    sample_data = dataset["test"].shuffle(seed=42).select(range(num_samples)) # pyright: ignore
+    # --- LA CORRECTION EST ICI ---
+    mlps = get_mlp_modules(model)
+    activations = {i: [] for i in range(len(mlps))}
+    # -----------------------------
     
-    # Dictionnaire pour stocker les activations capturées par couche
-    activations = {i: [] for i in range(len(model.model.layers))}
-    
-    # Définition de la fonction Hook
     def get_activation_hook(layer_idx):
         def hook(module, input, output):
             act = input[0].detach().cpu()
-            # Transformation de (batch, seq_len, dim) vers (batch * seq_len, dim)
             act = act.reshape(-1, act.shape[-1])
             activations[layer_idx].append(act)
         return hook
 
-    # On attache les hooks sur la couche 'down_proj' de chaque bloc MLP
     handles = []
     print("Mise en place des hooks sur les couches FFN...")
-    for i, layer in enumerate(model.model.layers):
-        handle = layer.mlp.down_proj.register_forward_hook(get_activation_hook(i))
+    # On itère directement sur la liste dynamique des MLPs
+    for i, mlp in enumerate(mlps):
+        handle = mlp.down_proj.register_forward_hook(get_activation_hook(i))
         handles.append(handle)
 
     print("Passage des données dans le modèle (Inférence)...")
@@ -92,110 +103,7 @@ def capture_activations(model, tokenizer, dataset_path, num_samples=200, max_tok
     print("Capture terminée ! Les activations sont prêtes pour l'analyse.")
     return activations
 
-
 # ==========================================
-# ÉTAPE 3 : Calcul de l'Information Mutuelle
-# ==========================================
-
-def compute_kernel_matrix(z, sigma):
-    """
-    Calcule la matrice de noyau RBF pour un vecteur d'activations d'un neurone.
-    z : tenseur 1D de taille (N_samples)
-    """
-    # z.unsqueeze(1) -> colonne, z.unsqueeze(0) -> ligne
-    # La diffusion (broadcasting) crée une matrice des différences au carré
-    dist_sq = (z.unsqueeze(1) - z.unsqueeze(0)) ** 2
-    
-    # Noyau RBF (Radial Basis Function)
-    K = torch.exp(-dist_sq / (2 * (sigma ** 2)))
-    return K
-
-def compute_renyi_entropy(K, alpha=1.01):
-    """
-    Calcule l'entropie de Rényi d'ordre alpha pour une matrice de noyau.
-    """
-    # Normalisation de la matrice pour que la trace soit égale à 1
-    trace_K = torch.trace(K)
-    if trace_K == 0:
-        return torch.tensor(0.0)
-    
-    K_norm = K / trace_K
-    
-    # Calcul des valeurs propres (eigvalsh est optimisé pour les matrices symétriques)
-    # On ajoute une petite valeur epsilon sur la diagonale pour la stabilité numérique
-    epsilon = 1e-8
-    K_norm = K_norm + torch.eye(K_norm.size(0), device=K_norm.device) * epsilon
-    
-    eigvals = torch.linalg.eigvalsh(K_norm)
-    
-    # On ignore les valeurs propres négatives (artefacts numériques)
-    eigvals = torch.clamp(eigvals, min=1e-10)
-    
-    # Formule de l'entropie de Rényi
-    entropy = (1 / (1 - alpha)) * torch.log2(torch.sum(eigvals ** alpha))
-    return entropy
-
-def optimize_kernel_width(z, sigma_l, max_iter=20, lr=0.1):
-    """
-    Optimise le paramètre sigma d'un neurone en maximisant le Kernel Alignment Loss
-    par rapport au noyau global de la couche (sigma_l).
-    """
-    # z: tenseur 1D (N_samples)
-    device = z.device
-    
-    # On initialise le sigma du neurone avec la valeur de Scott globale
-    sigma_n = torch.tensor([sigma_l], requires_grad=True, device=device)
-    optimizer = torch.optim.Adam([sigma_n], lr=lr)
-    
-    # Noyau de référence (constant)
-    K_l = compute_kernel_matrix(z, sigma_l).detach()
-    norm_K_l = torch.norm(K_l, p='fro')
-    
-    for _ in range(max_iter):
-        optimizer.zero_grad()
-        K_n = compute_kernel_matrix(z, sigma_n)
-        
-        # Kernel Alignment = <K_l, K_n>_F / (||K_l||_F * ||K_n||_F)
-        inner_product = torch.sum(K_l * K_n)
-        norm_K_n = torch.norm(K_n, p='fro')
-        
-        alignment = inner_product / (norm_K_l * norm_K_n + 1e-8)
-        
-        # Maximiser l'alignement équivaut à minimiser son opposé
-        loss = -alignment
-        loss.backward()
-        optimizer.step()
-        
-        # S'assurer que sigma_n reste strictement positif
-        with torch.no_grad():
-            sigma_n.clamp_(min=1e-3)
-            
-    return sigma_n.item()
-
-def calculate_mi_between_neurons(z_k, z_l, sigma_l, alpha=1.01):
-    """
-    Calcule l'Information Mutuelle I(Z_k ; Z_l) entre deux neurones avec optimisation de sigma.
-    """
-    # 1. Optimisation des largeurs de noyau individuelles
-    sigma_k = optimize_kernel_width(z_k, sigma_l)
-    sigma_l_opt = optimize_kernel_width(z_l, sigma_l)
-    
-    # 2. Matrices de noyaux individuelles optimisées
-    K_k = compute_kernel_matrix(z_k, sigma_k)
-    K_l = compute_kernel_matrix(z_l, sigma_l_opt)
-    
-    # 3. Entropies individuelles
-    S_k = compute_renyi_entropy(K_k, alpha)
-    S_l = compute_renyi_entropy(K_l, alpha)
-    
-    # 4. Matrice de noyau jointe
-    K_joint = K_k * K_l
-    S_joint = compute_renyi_entropy(K_joint, alpha)
-    
-    # Information Mutuelle
-    MI = S_k + S_l - S_joint
-    return max(0.0, MI.item())
-
 def compute_mutual_information(activations, alpha=1.01, gamma=1.0, compression_rate=0.1, block_size=2048):
     """
     Identifie les neurones redondants par blocs pour traiter toute la couche.
@@ -277,8 +185,6 @@ def compute_mutual_information(activations, alpha=1.01, gamma=1.0, compression_r
     return redundant_pairs_by_layer
 
 # ==========================================
-# ÉTAPE 4 : Pruning et Sauvegarde
-# ==========================================
 def prune_and_save_model(model, tokenizer, redundant_pairs_by_layer, save_path):
     """
     Découpe physiquement les neurones redondants dans les blocs MLP du modèle
@@ -286,14 +192,14 @@ def prune_and_save_model(model, tokenizer, redundant_pairs_by_layer, save_path):
     """
     print("\n--- Étape 4 : Découpe physique des neurones et Sauvegarde ---")
     
-    # On itère sur chaque couche analysée
+    mlps = get_mlp_modules(model)
+    # -----------------------------
+    
     for layer_idx, redundant_pairs in redundant_pairs_by_layer.items():
         if not redundant_pairs:
             continue
             
-        # 1. Identifier les neurones à supprimer (on supprime le neurone 'l' de chaque paire)
         indices_to_drop = set()
-        # Le format attendu de redundant_pairs est (neurone_gardé, neurone_supprimé, score)
         for k, l, mi_score in redundant_pairs:
             indices_to_drop.add(l)
             
@@ -301,11 +207,10 @@ def prune_and_save_model(model, tokenizer, redundant_pairs_by_layer, save_path):
         if not indices_to_drop:
             continue
             
-        # Récupération du bloc MLP cible
-        mlp = model.model.layers[layer_idx].mlp
-        current_dim = mlp.gate_proj.weight.shape[0] # Dimension intermédiaire actuelle
+        # On utilise le bloc MLP récupéré dynamiquement
+        mlp = mlps[layer_idx]
+        current_dim = mlp.gate_proj.weight.shape[0]
         
-        # 2. Créer le tenseur des indices à conserver
         indices_to_keep = [i for i in range(current_dim) if i not in indices_to_drop]
         keep_tensor = torch.tensor(indices_to_keep, device=model.device)
         
@@ -339,38 +244,13 @@ def prune_and_save_model(model, tokenizer, redundant_pairs_by_layer, save_path):
     # Dans HuggingFace, on modifie la config globale pour refléter la nouvelle taille du MLP.
     # On présuppose ici un élagage uniforme (même nombre de neurones supprimés sur chaque couche modifiée).
     if redundant_pairs_by_layer:
-        # On récupère la nouvelle taille sur la première couche élaguée
-        first_pruned_layer = list(redundant_pairs_by_layer.keys())[0]
-        new_intermediate_size = model.model.layers[first_pruned_layer].mlp.gate_proj.out_features
-        model.config.intermediate_size = new_intermediate_size
-        print(f"\nMise à jour de la configuration : intermediate_size = {new_intermediate_size}")
+            first_pruned_layer = list(redundant_pairs_by_layer.keys())[0]
+            # On lit la nouvelle taille directement sur le module modifié
+            new_intermediate_size = mlps[first_pruned_layer].gate_proj.out_features
+            model.config.intermediate_size = new_intermediate_size
+            print(f"\nMise à jour de la configuration globale : intermediate_size = {new_intermediate_size}")
 
     print(f"\nSauvegarde du modèle élagué dans {save_path}...")
     model.save_pretrained(save_path)
     tokenizer.save_pretrained(save_path)
     print("Opération terminée ! Le modèle est prêt pour le benchmark.")
-
-# ==========================================
-# EXECUTION PRINCIPALE
-# ==========================================
-if __name__ == "__main__":
-    MODEL_ID = "google/gemma-4-E4B-it"
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    DATASET_PATH = os.path.join(BASE_DIR, "data", "unified")
-    SAVE_PATH = os.path.join(BASE_DIR, "models", "gemma4-pruned-mi")
-    
-    print("Démarrage du processus de compression...")
-    
-    # 1. Init
-    model, tokenizer = load_gemma_model(MODEL_ID)
-    
-    # 2. Calibration
-    activations = capture_activations(model, tokenizer, DATASET_PATH)
-    
-    # 3. Analyse
-    mi_scores = compute_mutual_information(activations)
-    
-    # 4. Découpe et sauvegarde
-    prune_and_save_model(model, tokenizer, mi_scores, SAVE_PATH)
-    
-    print("Compression terminée avec succès !")
